@@ -1,0 +1,118 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Couch — watch together</title>
+<style>
+  :root { --bg:#1b1714; --panel:#26201c; --ink:#f3ebe0; --mute:#a99c8c; --accent:#e8b04a; --line:#3a312a; }
+  * { box-sizing:border-box; }
+  body { margin:0; background:var(--bg); color:var(--ink); font:16px/1.5 Georgia, "Times New Roman", serif; }
+  button, input { font:inherit; }
+  input { background:var(--bg); color:var(--ink); border:1px solid var(--line); border-radius:6px; padding:.6rem .75rem; }
+  input:focus-visible, button:focus-visible { outline:2px solid var(--accent); outline-offset:2px; }
+  button { background:var(--accent); color:#1b1714; border:0; border-radius:6px; padding:.6rem 1rem; cursor:pointer; font-weight:bold; }
+  #join { max-width:420px; margin:12vh auto; padding:0 1.25rem; }
+  #join h1 { font-size:2.6rem; margin:0 0 .25rem; }
+  #join p { color:var(--mute); margin:0 0 1.5rem; }
+  #join form { display:grid; gap:.75rem; }
+  #app { display:none; grid-template-columns:1fr 320px; height:100vh; }
+  main { padding:1rem; display:flex; flex-direction:column; gap:.75rem; min-width:0; }
+  video { width:100%; flex:1; min-height:0; background:#000; border-radius:8px; }
+  .bar { display:flex; gap:.5rem; flex-wrap:wrap; align-items:center; }
+  .bar input { flex:1; min-width:180px; }
+  .bar .or { color:var(--mute); }
+  .file { background:var(--panel); color:var(--ink); border:1px solid var(--line); }
+  aside { background:var(--panel); border-left:1px solid var(--line); display:flex; flex-direction:column; min-height:0; }
+  aside header { padding:.75rem 1rem; border-bottom:1px solid var(--line); color:var(--mute); }
+  #log { flex:1; overflow-y:auto; padding:1rem; display:grid; gap:.5rem; align-content:start; }
+  #log b { color:var(--accent); }
+  #chatForm { display:flex; gap:.5rem; padding:.75rem; border-top:1px solid var(--line); }
+  #chatForm input { flex:1; min-width:0; }
+  #note { color:var(--mute); font-size:.9rem; }
+  @media (max-width:800px) { #app { grid-template-columns:1fr; grid-template-rows:auto 45vh; height:auto; } video { aspect-ratio:16/9; flex:none; } }
+</style>
+</head>
+<body>
+<section id="join">
+  <h1>Couch</h1>
+  <p>Watch together, even when you’re far apart.</p>
+  <form id="joinForm">
+    <input id="name" placeholder="Your name" required maxlength="20">
+    <input id="room" placeholder="Room name (share it with friends)" required maxlength="30">
+    <button>Join room</button>
+  </form>
+</section>
+
+<div id="app">
+  <main>
+    <video id="v" controls playsinline></video>
+    <div class="bar">
+      <input id="url" placeholder="Paste a direct video link (.mp4 / .webm)">
+      <button id="load">Load for everyone</button>
+      <span class="or">or</span>
+      <label class="file button" style="padding:.6rem 1rem;border-radius:6px;cursor:pointer">Pick local file<input id="file" type="file" accept="video/*" hidden></label>
+    </div>
+    <div id="note">Local file: every friend picks the same file on their own device. Playback stays in sync.</div>
+  </main>
+  <aside>
+    <header>Room <b id="rn"></b> · <span id="cnt">1</span> watching</header>
+    <div id="log" aria-live="polite"></div>
+    <form id="chatForm"><input id="msg" placeholder="Say something" autocomplete="off"><button>Send</button></form>
+  </aside>
+</div>
+
+<script src="/socket.io/socket.io.js"></script>
+<script>
+const $ = (id) => document.getElementById(id);
+const v = $("v"), socket = io();
+let remote = false; // true while applying a remote change, to avoid echo loops
+
+$("joinForm").onsubmit = (e) => {
+  e.preventDefault();
+  const name = $("name").value.trim(), room = $("room").value.trim().toLowerCase();
+  socket.emit("join", { room, name });
+  $("rn").textContent = room;
+  $("join").style.display = "none";
+  $("app").style.display = "grid";
+};
+
+function applyRemote(fn) { remote = true; fn(); setTimeout(() => remote = false, 400); }
+function sync({ playing, time }) {
+  applyRemote(() => {
+    if (Math.abs(v.currentTime - time) > 1) v.currentTime = time;
+    if (playing && v.paused) v.play().catch(() => addChat("•", "Click the video once to allow playback"));
+    if (!playing && !v.paused) v.pause();
+  });
+}
+
+socket.on("state", (s) => {
+  if (s.src && v.src !== s.src && !s.src.startsWith("local:")) v.src = s.src;
+  if (s.src.startsWith("local:")) addChat("•", "Host is using a local file: " + s.src.slice(6) + ". Pick the same file.");
+  v.addEventListener("loadedmetadata", () => sync(s), { once: true });
+  if (v.readyState >= 1) sync(s);
+});
+socket.on("control", sync);
+socket.on("count", (n) => $("cnt").textContent = n);
+socket.on("chat", (m) => addChat(m.name, m.text));
+
+const send = () => { if (!remote) socket.emit("control", { playing: !v.paused, time: v.currentTime }); };
+v.onplay = v.onpause = v.onseeked = send;
+
+$("load").onclick = () => { const u = $("url").value.trim(); if (u) socket.emit("source", u); };
+$("file").onchange = (e) => {
+  const f = e.target.files[0]; if (!f) return;
+  v.src = URL.createObjectURL(f);
+  socket.emit("source", "local:" + f.name);
+};
+
+function addChat(name, text) {
+  const d = document.createElement("div");
+  const b = document.createElement("b"); b.textContent = name + ": ";
+  d.append(b, document.createTextNode(text));
+  $("log").append(d); $("log").scrollTop = 1e9;
+}
+$("chatForm").onsubmit = (e) => { e.preventDefault(); const t = $("msg").value.trim(); if (t) socket.emit("chat", t); $("msg").value = ""; };
+</script>
+</body>
+</html>

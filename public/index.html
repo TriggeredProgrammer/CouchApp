@@ -19,6 +19,8 @@
   #app { display:none; grid-template-columns:1fr 320px; height:100vh; }
   main { padding:1rem; display:flex; flex-direction:column; gap:.75rem; min-width:0; }
   video { width:100%; flex:1; min-height:0; background:#000; border-radius:8px; }
+  #sv { width:100%; flex:1; min-height:0; background:#000; border-radius:8px; display:none; }
+  #yt { flex:1; min-height:0; display:none; } #yt iframe { width:100%; height:100%; border-radius:8px; border:0; }
   .bar { display:flex; gap:.5rem; flex-wrap:wrap; align-items:center; }
   .bar input { flex:1; min-width:180px; }
   .bar .or { color:var(--mute); }
@@ -47,13 +49,16 @@
 <div id="app">
   <main>
     <video id="v" controls playsinline></video>
+    <video id="sv" autoplay playsinline controls></video>
+    <div id="yt"><div id="ytp"></div></div>
     <div class="bar">
-      <input id="url" placeholder="Paste a direct video link (.mp4 / .webm)">
+      <input id="url" placeholder="Paste a YouTube link or direct video link (.mp4)">
       <button id="load">Load for everyone</button>
+      <button id="share" class="file">Share my screen</button>
       <span class="or">or</span>
       <label class="file button" style="padding:.6rem 1rem;border-radius:6px;cursor:pointer">Pick local file<input id="file" type="file" accept="video/*" hidden></label>
     </div>
-    <div id="note">Local file: every friend picks the same file on their own device. Playback stays in sync.</div>
+    <div id="note">To watch Netflix or any site: click Share my screen, choose the browser tab, and tick the box to share tab audio. YouTube links work for everyone automatically. For a local file, every friend picks the same file on their own device, then playback stays in sync.</div>
   </main>
   <aside>
     <header>Room <b id="rn"></b> · <span id="cnt">1</span> watching</header>
@@ -66,7 +71,8 @@
 <script>
 const $ = (id) => document.getElementById(id);
 const v = $("v"), socket = io();
-let remote = false; // true while applying a remote change, to avoid echo loops
+let mode = "video", yt = null, remote = false, localName = "", roomSrc = "";
+let lastT = 0, lastWall = Date.now();
 
 $("joinForm").onsubmit = (e) => {
   e.preventDefault();
@@ -77,34 +83,148 @@ $("joinForm").onsubmit = (e) => {
   $("app").style.display = "grid";
 };
 
-function applyRemote(fn) { remote = true; fn(); setTimeout(() => remote = false, 400); }
+const ytId = (u) => { const m = u.match(/(?:youtu\.be\/|v=|embed\/|shorts\/|live\/)([\w-]{11})/); return m ? m[1] : null; };
+function loadYT(cb) {
+  if (window.YT && YT.Player) return cb();
+  window.onYouTubeIframeAPIReady = cb;
+  const s = document.createElement("script"); s.src = "https://www.youtube.com/iframe_api"; document.head.append(s);
+}
+
+const P = {
+  time: () => mode === "yt" ? (yt && yt.getCurrentTime ? yt.getCurrentTime() : 0) : v.currentTime,
+  playing: () => mode === "yt" ? (yt && yt.getPlayerState ? yt.getPlayerState() === 1 : false) : !v.paused,
+  seek: (t) => mode === "yt" ? yt.seekTo(t, true) : (v.currentTime = t),
+  play: () => mode === "yt" ? yt.playVideo() : v.play().catch(() => addChat("•", "Click the video once to allow playback")),
+  pause: () => mode === "yt" ? yt.pauseVideo() : v.pause()
+};
+
+function show(m) { mode = m; v.style.display = m === "video" ? "block" : "none"; $("yt").style.display = m === "yt" ? "block" : "none"; $("sv").style.display = m === "share" ? "block" : "none"; }
+
+function setSource(src, then) {
+  roomSrc = src;
+  const id = ytId(src);
+  if (id) {
+    show("yt"); v.pause();
+    loadYT(() => {
+      if (yt && yt.destroy) yt.destroy();
+      $("yt").innerHTML = '<div id="ytp"></div>';
+      yt = new YT.Player("ytp", { videoId: id, playerVars: { playsinline: 1, rel: 0 },
+        events: { onReady: () => then && then(), onStateChange: () => send() } });
+    });
+  } else {
+    show("video"); v.src = src;
+    v.onloadedmetadata = () => then && then();
+  }
+}
+
 function sync({ playing, time }) {
-  applyRemote(() => {
-    if (Math.abs(v.currentTime - time) > 1) v.currentTime = time;
-    if (playing && v.paused) v.play().catch(() => addChat("•", "Click the video once to allow playback"));
-    if (!playing && !v.paused) v.pause();
-  });
+  remote = true;
+  try {
+    if (Math.abs(P.time() - time) > 1.5) P.seek(time);
+    playing ? P.play() : P.pause();
+  } catch (e) {}
+  setTimeout(() => remote = false, 900);
 }
 
 socket.on("state", (s) => {
-  if (s.src && v.src !== s.src && !s.src.startsWith("local:")) v.src = s.src;
-  if (s.src.startsWith("local:")) addChat("•", "Host is using a local file: " + s.src.slice(6) + ". Pick the same file.");
-  v.addEventListener("loadedmetadata", () => sync(s), { once: true });
-  if (v.readyState >= 1) sync(s);
+  if (!s.src) return;
+  if (s.src.startsWith("local:")) roomSrc = s.src;
+  if (s.src.startsWith("local:")) {
+    const name = s.src.slice(6);
+    if (localName === name) return sync(s);
+    addChat("•", "Local file in use: " + name + ". Pick the same file on your device.");
+    return;
+  }
+  if (s.src !== roomSrc) setSource(s.src, () => sync(s)); else sync(s);
 });
 socket.on("control", sync);
 socket.on("count", (n) => $("cnt").textContent = n);
 socket.on("chat", (m) => addChat(m.name, m.text));
 
-const send = () => { if (!remote) socket.emit("control", { playing: !v.paused, time: v.currentTime }); };
+function send() { if (!remote) socket.emit("control", { playing: P.playing(), time: P.time() }); }
 v.onplay = v.onpause = v.onseeked = send;
+
+// YouTube has no seek event, so watch for jumps in time
+setInterval(() => {
+  if (mode !== "yt" || !yt || !yt.getCurrentTime) return;
+  const t = yt.getCurrentTime(), now = Date.now();
+  const expected = lastT + (P.playing() ? (now - lastWall) / 1000 : 0);
+  if (!remote && Math.abs(t - expected) > 1.5) send();
+  lastT = t; lastWall = now;
+}, 1000);
 
 $("load").onclick = () => { const u = $("url").value.trim(); if (u) socket.emit("source", u); };
 $("file").onchange = (e) => {
   const f = e.target.files[0]; if (!f) return;
-  v.src = URL.createObjectURL(f);
-  socket.emit("source", "local:" + f.name);
+  const same = roomSrc === "local:" + f.name; // room already uses this file
+  localName = f.name;
+  show("video"); v.src = URL.createObjectURL(f);
+  if (same) v.onloadedmetadata = () => socket.emit("resync");
+  else { roomSrc = "local:" + f.name; socket.emit("source", roomSrc); }
 };
+
+// ---------- screen sharing (WebRTC) ----------
+const ICE = { iceServers: [{ urls: "stun:stun.l.google.com:19302" }, { urls: "stun:stun1.l.google.com:19302" }] };
+const sv = $("sv"), pcs = {}, pending = {};
+let stream = null, vpc = null, chain = Promise.resolve();
+
+function endShareLocal() {
+  Object.values(pcs).forEach((c) => c.close());
+  for (const k in pcs) delete pcs[k];
+  if (stream) stream.getTracks().forEach((t) => t.stop());
+  stream = null; sv.srcObject = null; $("share").textContent = "Share my screen";
+  show("video");
+}
+$("share").onclick = async () => {
+  if (stream) { socket.emit("share-stop"); return endShareLocal(); }
+  try {
+    stream = await navigator.mediaDevices.getDisplayMedia({ video: true, audio: true });
+  } catch (e) { addChat("•", "Screen sharing was cancelled or isn't supported on this device."); return; }
+  if (!stream.getAudioTracks().length) addChat("•", "No sound is being shared. Share a browser tab and tick 'Also share tab audio'.");
+  stream.getVideoTracks()[0].onended = () => { socket.emit("share-stop"); endShareLocal(); };
+  sv.srcObject = stream; sv.muted = true; show("share");
+  $("share").textContent = "Stop sharing";
+  socket.emit("share-start");
+};
+
+function mkPc(peer) {
+  const pc = new RTCPeerConnection(ICE);
+  pc.onicecandidate = (e) => e.candidate && socket.emit("rtc", { to: peer, data: { cand: e.candidate } });
+  return pc;
+}
+socket.on("share-started", ({ from }) => {
+  if (stream) return;
+  show("share"); sv.muted = false;
+  socket.emit("rtc", { to: from, data: { type: "want" } });
+});
+socket.on("share-stopped", () => { if (vpc) vpc.close(); vpc = null; sv.srcObject = null; show("video"); });
+
+async function onRtc({ from, data }) {
+  if (data.type === "want" && stream) {
+    const pc = mkPc(from); pcs[from] = pc;
+    stream.getTracks().forEach((t) => pc.addTrack(t, stream));
+    await pc.setLocalDescription(await pc.createOffer());
+    socket.emit("rtc", { to: from, data: { sdp: pc.localDescription } });
+  } else if (data.sdp && data.sdp.type === "offer") {
+    if (vpc) vpc.close();
+    vpc = mkPc(from);
+    vpc.ontrack = (e) => { sv.srcObject = e.streams[0]; sv.play().catch(() => addChat("•", "Click the video once to hear the sound")); };
+    await vpc.setRemoteDescription(data.sdp);
+    for (const c of pending[from] || []) await vpc.addIceCandidate(c).catch(() => {});
+    pending[from] = [];
+    await vpc.setLocalDescription(await vpc.createAnswer());
+    socket.emit("rtc", { to: from, data: { sdp: vpc.localDescription } });
+  } else if (data.sdp && pcs[from]) {
+    await pcs[from].setRemoteDescription(data.sdp);
+    for (const c of pending[from] || []) await pcs[from].addIceCandidate(c).catch(() => {});
+    pending[from] = [];
+  } else if (data.cand) {
+    const pc = stream ? pcs[from] : vpc;
+    if (pc && pc.remoteDescription) await pc.addIceCandidate(data.cand).catch(() => {});
+    else (pending[from] ||= []).push(data.cand);
+  }
+}
+socket.on("rtc", (m) => { chain = chain.then(() => onRtc(m)).catch(console.error); });
 
 function addChat(name, text) {
   const d = document.createElement("div");
